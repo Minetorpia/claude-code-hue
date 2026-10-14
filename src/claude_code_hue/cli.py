@@ -2,14 +2,18 @@
 """Use a Philips Hue room as a concurrency-safe Claude Code work indicator."""
 
 import argparse
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows: no POSIX locks; FileLock falls back to msvcrt.
+    fcntl = None
+    import msvcrt
 import hashlib
 import hmac
 import http.client
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import shlex
 import shutil
@@ -45,6 +49,7 @@ INTERRUPT_MARKERS = (
     "[Request interrupted by user for tool use]",
 )
 PROJECT_NAME = "claude-code-hue"
+HOOK_ARGUMENTS = ["-m", "claude_code_hue", "hook"]
 
 
 class HueError(RuntimeError):
@@ -123,6 +128,21 @@ def read_json(path, default):
         return default
 
 
+def replace_file(source, destination):
+    if os.name != "nt":
+        os.replace(source, destination)
+        return
+    # Windows refuses to replace a file another process (a reader, antivirus,
+    # the search indexer) has open at that instant; such holds are brief.
+    for _ in range(40):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+    os.replace(source, destination)
+
+
 def write_json_atomic(path, value):
     ensure_data_dir()
     descriptor, temporary_name = tempfile.mkstemp(
@@ -135,7 +155,7 @@ def write_json_atomic(path, value):
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temporary_name, 0o600)
-        os.replace(temporary_name, path)
+        replace_file(temporary_name, path)
     finally:
         try:
             os.unlink(temporary_name)
@@ -151,6 +171,12 @@ class FileLock:
     def __enter__(self):
         ensure_data_dir()
         self.descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        if fcntl is None:
+            if not self._lock_windows():
+                os.close(self.descriptor)
+                self.descriptor = None
+                return None
+            return self
         flags = fcntl.LOCK_EX
         if self.nonblocking:
             flags |= fcntl.LOCK_NB
@@ -162,13 +188,29 @@ class FileLock:
             return None
         return self
 
+    def _lock_windows(self):
+        # Lock the first byte as a whole-file stand-in for flock. LK_LOCK gives
+        # up after ten seconds, so a blocking acquire polls LK_NBLCK instead.
+        while True:
+            try:
+                msvcrt.locking(self.descriptor, msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError:
+                if self.nonblocking:
+                    return False
+                time.sleep(0.05)
+
     def __exit__(self, exc_type, exc_value, traceback):
         self.release()
 
     def release(self):
         if self.descriptor is None:
             return
-        fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+        if fcntl is None:
+            os.lseek(self.descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(self.descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(self.descriptor, fcntl.LOCK_UN)
         os.close(self.descriptor)
         self.descriptor = None
 
@@ -846,6 +888,9 @@ def spawn_drain_worker():
     with open(os.devnull, "rb") as stdin_handle, open(
         os.devnull, "ab"
     ) as output_handle:
+        if os.name == "nt":
+            spawn_windows_worker(command, stdin_handle, output_handle)
+            return
         subprocess.Popen(
             command,
             stdin=stdin_handle,
@@ -854,6 +899,26 @@ def spawn_drain_worker():
             close_fds=True,
             start_new_session=True,
         )
+
+
+def spawn_windows_worker(command, stdin_handle, output_handle):
+    # The Windows counterpart of start_new_session: no console window, its own
+    # process group, and outside the hook's job object when the job allows it.
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    for extra in (subprocess.CREATE_BREAKAWAY_FROM_JOB, 0):
+        try:
+            subprocess.Popen(
+                command,
+                stdin=stdin_handle,
+                stdout=output_handle,
+                stderr=output_handle,
+                close_fds=True,
+                creationflags=flags | extra,
+            )
+            return
+        except OSError:
+            if not extra:
+                raise
 
 
 def dispatch_event(event_name, session_id, turn_id, transcript_path=None):
@@ -1040,6 +1105,9 @@ def hook_command():
     # Print nothing: Claude Code adds UserPromptSubmit and SessionStart stdout
     # to the model's context. Only identifiers are read from the payload; the
     # prompt and assistant text it also carries are never logged or stored.
+    if os.name == "nt" and hasattr(sys.stdin, "reconfigure"):
+        # Claude Code sends UTF-8; Windows would otherwise decode the ANSI codepage.
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
     try:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
@@ -1299,6 +1367,8 @@ def recover_command():
 def is_our_hook_handler(handler):
     if not isinstance(handler, dict):
         return False
+    if handler.get("args") == HOOK_ARGUMENTS:
+        return True  # Exec form, as installed on Windows.
     command = str(handler.get("command", ""))
     return "claude_code_hue" in command and command.rstrip().endswith(" hook")
 
@@ -1334,18 +1404,19 @@ def remove_our_hook_handlers(document):
     return removed
 
 
+def hook_handler_command():
+    if os.name == "nt":
+        # Exec form runs without a shell. On Windows a command string would go
+        # to Git Bash or PowerShell, which quote paths with spaces differently.
+        return {"command": PureWindowsPath(sys.executable).as_posix(), "args": list(HOOK_ARGUMENTS)}
+    return {"command": shlex.join([sys.executable] + HOOK_ARGUMENTS)}
+
+
 def hue_hook_group(status_message, matcher=None, timeout=5):
-    arguments = [sys.executable, "-m", "claude_code_hue", "hook"]
-    group = {
-        "hooks": [
-            {
-                "type": "command",
-                "command": shlex.join(arguments),
-                "timeout": timeout,
-                "statusMessage": status_message,
-            }
-        ]
-    }
+    handler = {"type": "command"}
+    handler.update(hook_handler_command())
+    handler.update(timeout=timeout, statusMessage=status_message)
+    group = {"hooks": [handler]}
     if matcher:
         group["matcher"] = matcher
     return group
@@ -1398,7 +1469,7 @@ def write_settings_atomic(path, document):
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temporary_name, mode)
-        os.replace(temporary_name, path)
+        replace_file(temporary_name, path)
     finally:
         try:
             os.unlink(temporary_name)
