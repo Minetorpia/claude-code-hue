@@ -337,7 +337,7 @@ class IndicatorTests(unittest.TestCase):
         config_dir.mkdir()
         existing = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other-tool"}]}]}}
         INDICATOR.settings_path().write_text(json.dumps(existing))
-        with mock.patch.object(INDICATOR.os, "name", "nt"), \
+        with mock.patch.object(INDICATOR, "WINDOWS", True), \
              mock.patch.object(INDICATOR.sys, "executable", r"C:\Program Files\Py\python.exe"), \
              redirect_stdout(io.StringIO()):
             INDICATOR.install_hooks_command()

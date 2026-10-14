@@ -50,6 +50,7 @@ INTERRUPT_MARKERS = (
 )
 PROJECT_NAME = "claude-code-hue"
 HOOK_ARGUMENTS = ["-m", "claude_code_hue", "hook"]
+WINDOWS = os.name == "nt"
 
 
 class HueError(RuntimeError):
@@ -129,7 +130,7 @@ def read_json(path, default):
 
 
 def replace_file(source, destination):
-    if os.name != "nt":
+    if not WINDOWS:
         os.replace(source, destination)
         return
     # Windows refuses to replace a file another process (a reader, antivirus,
@@ -888,7 +889,7 @@ def spawn_drain_worker():
     with open(os.devnull, "rb") as stdin_handle, open(
         os.devnull, "ab"
     ) as output_handle:
-        if os.name == "nt":
+        if WINDOWS:
             spawn_windows_worker(command, stdin_handle, output_handle)
             return
         subprocess.Popen(
@@ -1105,7 +1106,7 @@ def hook_command():
     # Print nothing: Claude Code adds UserPromptSubmit and SessionStart stdout
     # to the model's context. Only identifiers are read from the payload; the
     # prompt and assistant text it also carries are never logged or stored.
-    if os.name == "nt" and hasattr(sys.stdin, "reconfigure"):
+    if WINDOWS and hasattr(sys.stdin, "reconfigure"):
         # Claude Code sends UTF-8; Windows would otherwise decode the ANSI codepage.
         sys.stdin.reconfigure(encoding="utf-8", errors="replace")
     try:
@@ -1405,7 +1406,7 @@ def remove_our_hook_handlers(document):
 
 
 def hook_handler_command():
-    if os.name == "nt":
+    if WINDOWS:
         # Exec form runs without a shell. On Windows a command string would go
         # to Git Bash or PowerShell, which quote paths with spaces differently.
         return {"command": PureWindowsPath(sys.executable).as_posix(), "args": list(HOOK_ARGUMENTS)}
