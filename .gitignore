@@ -1,0 +1,15 @@
+.DS_Store
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Runtime files belong in ~/.claude/hue-indicator, never in the repository.
+config.json
+state.json
+events.json
+*.log
