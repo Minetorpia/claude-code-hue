@@ -57,6 +57,17 @@ class HueError(RuntimeError):
     pass
 
 
+_bridge_contact = [float("-inf")]
+
+
+def note_bridge_contact():
+    _bridge_contact[0] = time.monotonic()
+
+
+def last_bridge_contact():
+    return _bridge_contact[0]
+
+
 def data_dir():
     override = os.environ.get("CLAUDE_CODE_HUE_DATA_DIR")
     if override:
@@ -256,6 +267,7 @@ class HueClient:
             connection.request(method, path, body=body, headers=headers)
             response = connection.getresponse()
             raw = response.read()
+            note_bridge_contact()
             if response.status < 200 or response.status >= 300:
                 raise HueError("Hue Bridge returned HTTP {}".format(response.status))
             try:
@@ -783,15 +795,6 @@ def process_event(event_name, session_id, turn_id, client=None,
             )
             return
 
-        if not state["active"] and state.get("snapshot") and event_name == "UserPromptSubmit":
-            restore_room(
-                client,
-                state["snapshot"],
-                transitiontime=config.get("restore_transitiontime", 2),
-                request_gap_seconds=config.get("restore_request_gap_seconds", 0.12),
-            )
-            state["snapshot"] = None
-
         if event_name == "UserPromptSubmit":
             if key in state["completed"]:
                 return
@@ -812,6 +815,9 @@ def process_event(event_name, session_id, turn_id, client=None,
             if key not in state["active"]:
                 if was_idle:
                     state["next_busy_at"] = 0
+                    if state.get("pulse") == "solid":
+                        # A leftover snapshot is the real scene; re-assert blue.
+                        state["pulse"] = None
                 state["active"][key] = {
                     "started_at": time.time(),
                     "session_id": session_id or "",
@@ -820,8 +826,8 @@ def process_event(event_name, session_id, turn_id, client=None,
             if isinstance(transcript_path, str) and transcript_path:
                 state["active"][key]["transcript_path"] = transcript_path
             save_state(state)
-            advance_busy_state(state, config, client)
             log("Turn started; {} active".format(len(state["active"])))
+            advance_busy_state(state, config, client)
             return
 
         if event_name in ("TurnAborted", "StopFailure"):
@@ -842,11 +848,13 @@ def process_event(event_name, session_id, turn_id, client=None,
                 log("Ignored duplicate completion for {}".format(key))
                 return
 
-            prepare_completion_snapshot(state, config, client)
             state["active"].pop(key, None)
+            state["completed"][key] = time.time()
+            save_state(state)
+            log("Turn completed; {} active".format(len(state["active"])))
+            prepare_completion_snapshot(state, config, client)
             if not state["active"]:
                 state["breathing"] = None
-            state["completed"][key] = time.time()
             # Green restores the undimmed scene baseline, never the breathing dip.
             state["pulse"] = None
             state["next_busy_at"] = time.time() + busy_resume_delay(config)
@@ -857,7 +865,6 @@ def process_event(event_name, session_id, turn_id, client=None,
 
             finish_notification(state, config, client)
             time.sleep(float(config.get("completion_gap_seconds", 0.35)))
-            log("Turn completed; {} active".format(len(state["active"])))
             return
 
         log("Ignored unsupported hook event {}".format(event_name))
@@ -1048,33 +1055,90 @@ def reconcile_active_turns(reader, client=None):
     advance_busy_pulse(client, allow_start=False)
 
 
+class WorkerHealth:
+    """Back off after failures and notice when the Bridge stays unreachable.
+
+    Only a request the Bridge answered counts as recovery: many loop passes
+    succeed without contacting it, which must not reset the failure clock.
+    """
+
+    GIVE_UP_SECONDS = 60
+    MAX_DELAY_SECONDS = 30
+    REPEAT_LOG_SECONDS = 600
+
+    def __init__(self):
+        self.retry_at = 0.0
+        self.delay = 0.0
+        self.failed_at = None
+        self.unreachable_since = None
+        self.logged = None
+        self.logged_at = 0.0
+
+    def ready(self):
+        return time.monotonic() >= self.retry_at
+
+    def succeeded(self):
+        if self.failed_at is not None and last_bridge_contact() > self.failed_at:
+            if self.unreachable_since is not None:
+                log("Hue Bridge reachable again")
+            self.__init__()
+
+    def failed(self, what, error):
+        now = time.monotonic()
+        if isinstance(error, OSError) and (
+                self.unreachable_since is None or last_bridge_contact() > self.unreachable_since):
+            self.unreachable_since = now
+        message = "{} failed: {}".format(what, error)
+        if message != self.logged or now - self.logged_at >= self.REPEAT_LOG_SECONDS:
+            log(message + "; retrying with backoff")
+            self.logged, self.logged_at = message, now
+        self.failed_at = now
+        self.delay = min(self.MAX_DELAY_SECONDS, max(2.0, self.delay * 2))
+        self.retry_at = now + self.delay
+
+    def gave_up(self):
+        return (self.unreachable_since is not None
+                and last_bridge_contact() <= self.unreachable_since
+                and time.monotonic() - self.unreachable_since >= self.GIVE_UP_SECONDS)
+
+
 def drain_events():
     worker_lock = FileLock(worker_lock_path(), nonblocking=True)
     with worker_lock as acquired:
         if acquired is None:
             return
         reader = LifecycleReader()
+        health = WorkerHealth()
         next_check = 0
         while True:
             with QueueLock():
                 queue = read_json(queue_path(), [])
                 queued = dict(queue[0]) if isinstance(queue, list) and queue else None
-            if time.monotonic() >= next_check:
+            if time.monotonic() >= next_check and health.ready():
                 try:
                     reconcile_active_turns(reader)
+                    health.succeeded()
                 except Exception as error:
-                    log("Recovery check failed; will retry: {}".format(error))
+                    health.failed("Recovery check", error)
                 next_check = time.monotonic() + 2
             if queued is None:
-                try:
-                    advance_busy_pulse()
-                except Exception as error:
-                    log("Busy pulse failed; will retry: {}".format(error))
+                if health.ready():
+                    try:
+                        advance_busy_pulse()
+                        health.succeeded()
+                    except Exception as error:
+                        health.failed("Busy lighting update", error)
                 with StateLock():
                     state = load_state()
                     with QueueLock():
-                        if (not read_json(queue_path(), []) and not state["active"]
-                                and not state.get("snapshot") and not state.get("breathing")):
+                        idle = (not state["active"] and not state.get("snapshot")
+                                and not state.get("breathing"))
+                        if not read_json(queue_path(), []) and (idle or health.gave_up()):
+                            if not idle:
+                                # A process can stay cut off from the local
+                                # network; the next hook starts a fresh worker.
+                                log("Hue Bridge unreachable for {} s; worker stopping "
+                                    "until the next hook".format(health.GIVE_UP_SECONDS))
                             # Release while holding the queue lock so a new
                             # event can start its worker immediately.
                             worker_lock.release()
@@ -1088,12 +1152,9 @@ def drain_events():
                     queued.get("turn_id", ""),
                     transcript_path=queued.get("transcript_path"),
                 )
+                health.succeeded()
             except Exception as error:
-                log(
-                    "{} worker failed: {}".format(
-                        queued.get("event_name", "unknown"), error
-                    )
-                )
+                health.failed("{} event".format(queued.get("event_name", "unknown")), error)
             finally:
                 with QueueLock():
                     latest = read_json(queue_path(), [])

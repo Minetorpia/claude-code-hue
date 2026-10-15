@@ -260,6 +260,11 @@ different room or zone for each, or install only one.
   confirm that no Claude Code session is working before using
   `claude-code-hue reset` (which clears all active entries). Active turns never
   expire merely because they are old.
+- **Lights stop responding, log says the Bridge is unreachable:** check that
+  this computer is on the Bridge's network. A background worker that cannot
+  reach the Bridge for 60 seconds stops, and the next hook starts a fresh one;
+  run `claude-code-hue recover` to start it right away. Failed turns are still
+  recorded, so the room catches up as soon as the Bridge answers.
 - **Certificate fingerprint changed:** verify that the Bridge was replaced or
   reset before pairing again. Do not blindly modify the fingerprint.
 - **Some lights do not show color:** non-color lights can still change brightness

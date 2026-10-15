@@ -48,6 +48,15 @@ class FakeHueClient:
         self.light_states[str(light_id)].update(action)
 
 
+class UnreachableHueClient(FakeHueClient):
+    """A Bridge this process cannot reach, as after a stuck network change."""
+
+    def fail(self, *args):
+        raise OSError(65, "No route to host")
+
+    group = lights = light = group_action = light_state = fail
+
+
 class IndicatorTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -360,6 +369,86 @@ class IndicatorTests(unittest.TestCase):
                 self.assertIsNone(second)
         with INDICATOR.FileLock(path, nonblocking=True) as second:
             self.assertIsNotNone(second)
+
+    def test_unreachable_bridge_never_drops_a_new_turn(self):
+        INDICATOR.process_event("UserPromptSubmit", "session-a", "turn-a", self.client)
+        INDICATOR.process_event("Stop", "session-a", "turn-a", self.client)
+        state = INDICATOR.load_state()
+        state["snapshot"] = {"lights": {"1": dict(self.original["1"])}, "captured_at": 1}
+        INDICATOR.save_state(state)
+        with self.assertRaises(OSError):
+            INDICATOR.process_event("UserPromptSubmit", "session-a", "turn-b",
+                                    UnreachableHueClient())
+        state = INDICATOR.load_state()
+        self.assertEqual(["session-a:turn-b"], list(state["active"]))
+        self.assertIsNotNone(state["snapshot"])
+
+    def test_unreachable_bridge_still_completes_the_turn(self):
+        INDICATOR.process_event("UserPromptSubmit", "session-a", "turn-a", self.client)
+        with self.assertRaises(OSError):
+            INDICATOR.process_event("Stop", "session-a", "turn-a", UnreachableHueClient())
+        state = INDICATOR.load_state()
+        self.assertEqual({}, state["active"])
+        self.assertIn("session-a:turn-a", state["completed"])
+        self.assertIsNotNone(state["snapshot"])
+        # The worker restores the scene once the Bridge answers again.
+        INDICATOR.advance_busy_pulse(self.client)
+        self.assertIsNone(INDICATOR.load_state()["snapshot"])
+        self.assertEqual(self.original["1"]["bri"], self.client.light_states["1"]["bri"])
+
+    def test_new_turn_reasserts_blue_over_a_leftover_solid_snapshot(self):
+        config = INDICATOR.load_config()
+        config["busy_mode"] = "solid"
+        INDICATOR.write_json_atomic(INDICATOR.config_path(), config)
+        INDICATOR.process_event("UserPromptSubmit", "session-a", "turn-a", self.client)
+        state = INDICATOR.load_state()
+        del state["active"]["session-a:turn-a"]  # e.g. its Stop was lost
+        INDICATOR.save_state(state)
+        self.client.actions.clear()
+        INDICATOR.process_event("UserPromptSubmit", "session-a", "turn-b", self.client)
+        self.assertEqual([INDICATOR.DEFAULT_BUSY],
+                         [a[2] for a in self.client.actions if a[0] == "group"])
+        self.assertEqual(self.original["1"]["bri"],
+                         INDICATOR.load_state()["snapshot"]["lights"]["1"]["bri"])
+
+    def test_worker_stops_quietly_when_bridge_stays_unreachable(self):
+        INDICATOR.enqueue_event("UserPromptSubmit", "session-a", "turn-a")
+        current = [1000.0]
+        def tick(_):
+            current[0] += 0.5
+            if current[0] > 1300:
+                self.fail("worker kept running without reaching the Bridge")
+        with mock.patch.object(INDICATOR, "client_from_config", return_value=UnreachableHueClient()), \
+             mock.patch.object(INDICATOR.time, "monotonic", side_effect=lambda: current[0]), \
+             mock.patch.object(INDICATOR.time, "sleep", side_effect=tick):
+            INDICATOR.drain_events()
+        self.assertLess(current[0], 1000 + INDICATOR.WorkerHealth.GIVE_UP_SECONDS + 35)
+        self.assertEqual(["session-a:turn-a"], list(INDICATOR.load_state()["active"]))
+        lines = INDICATOR.log_path().read_text().splitlines()
+        self.assertLess(len(lines), 10)
+        self.assertIn("worker stopping until the next hook", lines[-1])
+        with INDICATOR.FileLock(INDICATOR.worker_lock_path(), nonblocking=True) as acquired:
+            self.assertIsNotNone(acquired)
+
+    def test_worker_health_backs_off_and_recovers_only_after_bridge_contact(self):
+        current = [50.0]
+        with mock.patch.object(INDICATOR.time, "monotonic", side_effect=lambda: current[0]):
+            health = INDICATOR.WorkerHealth()
+            delays = []
+            for _ in range(6):
+                health.failed("Busy lighting update", OSError(65, "No route to host"))
+                delays.append(health.retry_at - current[0])
+            self.assertEqual([2, 4, 8, 16, 30, 30], delays)
+            current[0] += 61
+            health.succeeded()  # A pass that never contacted the Bridge.
+            self.assertTrue(health.gave_up())
+            INDICATOR.note_bridge_contact()
+            health.succeeded()
+            self.assertFalse(health.gave_up())
+            self.assertTrue(health.ready())
+        logged = INDICATOR.log_path().read_text().splitlines()
+        self.assertEqual(2, len(logged))
+        self.assertIn("reachable again", logged[-1])
 
     def transcript(self, session="session-a", turn="turn-a", interrupted=False,
                    project="-Users-example-project", name=None):
