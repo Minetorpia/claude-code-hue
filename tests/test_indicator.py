@@ -280,7 +280,8 @@ class IndicatorTests(unittest.TestCase):
 
         installed = INDICATOR.read_json(INDICATOR.settings_path(), {})
         self.assertEqual(["permissions", "model", "hooks"], list(installed))
-        self.assertEqual(0o644, INDICATOR.settings_path().stat().st_mode & 0o777)
+        if os.name != "nt":  # Windows has no Unix permission bits to preserve.
+            self.assertEqual(0o644, INDICATOR.settings_path().stat().st_mode & 0o777)
         prompt_handlers = [
             handler
             for group in installed["hooks"]["UserPromptSubmit"]
@@ -319,7 +320,10 @@ class IndicatorTests(unittest.TestCase):
         dotfiles.mkdir()
         os.environ["CLAUDE_CONFIG_DIR"] = str(config_dir)
         (dotfiles / "settings.json").write_text("{}")
-        INDICATOR.settings_path().symlink_to(dotfiles / "settings.json")
+        try:
+            INDICATOR.settings_path().symlink_to(dotfiles / "settings.json")
+        except OSError:  # Windows without Developer Mode or elevation.
+            self.skipTest("creating symlinks is not permitted")
         with redirect_stdout(io.StringIO()):
             INDICATOR.install_hooks_command()
         self.assertTrue(INDICATOR.settings_path().is_symlink())
@@ -327,6 +331,35 @@ class IndicatorTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             INDICATOR.uninstall_hooks_command()
         self.assertEqual({}, INDICATOR.read_json(dotfiles / "settings.json", None))
+
+    def test_windows_hook_install_uses_exec_form_and_uninstalls(self):
+        config_dir = Path(self.temporary.name) / "claude-home"
+        config_dir.mkdir()
+        existing = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other-tool"}]}]}}
+        INDICATOR.settings_path().write_text(json.dumps(existing))
+        with mock.patch.object(INDICATOR, "WINDOWS", True), \
+             mock.patch.object(INDICATOR.sys, "executable", r"C:\Program Files\Py\python.exe"), \
+             redirect_stdout(io.StringIO()):
+            INDICATOR.install_hooks_command()
+            INDICATOR.install_hooks_command()
+            installed = INDICATOR.read_json(INDICATOR.settings_path(), {})
+            for event_name in INDICATOR.SUPPORTED_HOOK_EVENTS:
+                ours = [handler for group in installed["hooks"][event_name]
+                        for handler in group["hooks"] if INDICATOR.is_our_hook_handler(handler)]
+                self.assertEqual(1, len(ours))
+                self.assertEqual("C:/Program Files/Py/python.exe", ours[0]["command"])
+                self.assertEqual(["-m", "claude_code_hue", "hook"], ours[0]["args"])
+            INDICATOR.uninstall_hooks_command()
+        self.assertEqual(existing, INDICATOR.read_json(INDICATOR.settings_path(), {}))
+
+    def test_file_lock_excludes_second_holder_until_released(self):
+        path = INDICATOR.queue_lock_path()
+        with INDICATOR.FileLock(path) as held:
+            self.assertIsNotNone(held)
+            with INDICATOR.FileLock(path, nonblocking=True) as second:
+                self.assertIsNone(second)
+        with INDICATOR.FileLock(path, nonblocking=True) as second:
+            self.assertIsNotNone(second)
 
     def transcript(self, session="session-a", turn="turn-a", interrupted=False,
                    project="-Users-example-project", name=None):

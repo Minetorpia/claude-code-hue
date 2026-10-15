@@ -26,13 +26,10 @@ place.
 
 ## Requirements
 
-- Python 3.9 or newer on macOS or Linux
-- Claude Code 2.1.x (tested with 2.1.294)
+- Python 3.9 or newer on macOS, Linux, or Windows
+- Claude Code 2.1.x (tested with 2.1.294; on Windows, 2.1.300)
 - A Philips Hue Bridge on the same local network
 - A Hue room or zone containing color-capable lights
-
-Windows is not currently supported because the concurrency locks use POSIX
-`fcntl` file locking.
 
 ## Install
 
@@ -45,6 +42,9 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install .
 ```
+
+On Windows (PowerShell), activate with `.venv\Scripts\Activate.ps1` instead of
+`source .venv/bin/activate`, and use `python` rather than `python3`.
 
 Pair with your Bridge and select a room:
 
@@ -74,6 +74,17 @@ it. Use `/hooks` inside Claude Code to see the installed handlers.
 The hook configuration invokes the exact Python environment used to run
 `install-hooks`. Keep that environment installed. Re-run `install-hooks` after
 moving to a different environment.
+
+### Windows notes
+
+- Hooks are installed in Claude Code's exec form (`command` plus `args`), which
+  starts Python directly without a shell. It works whether Claude Code would
+  otherwise use Git Bash or PowerShell, and with spaces in the path.
+- The locks use `msvcrt` byte-range locking in place of `fcntl`. The background
+  worker starts with no console window and in its own process group.
+- Runtime data lives in `%USERPROFILE%\.claude\hue-indicator`. Windows has no
+  Unix file modes, so privacy relies on your user profile's default
+  permissions.
 
 ## Commands
 
